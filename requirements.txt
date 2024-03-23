@@ -4,3 +4,4 @@ torch>=2.1.0
 xformers
 simple-parsing
 nltk
+fairscale

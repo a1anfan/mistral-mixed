@@ -5,8 +5,11 @@ import pickle
 import glob
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import LlamaTokenizer
+from mistral.tokenizer import Tokenizer
 from loguru import logger
+
+# SAVE_DIR = "/gscratch/raivn/ethans/llms/mistral-mixed/ckpts"
+SAVE_DIR = "/gscratch/raivn/alanfan/mistral-mixed/ckpts"
 
 
 def create_corpuses(
@@ -127,17 +130,15 @@ def merge_counts_helper(c1, c2):
   return c1
 
 def save_corpus(b_d, t_d, fo_d, fi_d, si_d, se_d, start_doc, end_doc):
-  save_dir = "/gscratch/raivn/ethans/llms/llama-mixed/ckpts"
   prefixes = ["b_d", "t_d", "fo_d", "fi_d", "si_d", "se_d"]
   for p, corpus in zip(prefixes, [b_d, t_d, fo_d, fi_d, si_d, se_d]):
-    with open(f"{save_dir}/{p}{start_doc}-{end_doc}.pkl", "wb") as f:
+    with open(f"{SAVE_DIR}/{p}{start_doc}-{end_doc}.pkl", "wb") as f:
       pickle.dump(corpus, f)
 
 def save_counts(b_ct, t_ct, fo_ct, fi_ct, si_ct, se_ct, start_doc, end_doc):
-  save_dir = "/gscratch/raivn/ethans/llms/llama-mixed/ckpts"
   prefixes = ["b_ct", "t_ct", "fo_ct", "fi_ct", "si_ct", "se_ct"]
   for p, corpus in zip(prefixes, [b_ct, t_ct, fo_ct, fi_ct, si_ct, se_ct]):
-    with open(f"{save_dir}/{p}{start_doc}-{end_doc}.pkl", "wb") as f:
+    with open(f"{SAVE_DIR}/{p}{start_doc}-{end_doc}.pkl", "wb") as f:
       pickle.dump(corpus, f)
       
 def merge_corpuses(ckpt_path):
@@ -190,7 +191,7 @@ if __name__ == "__main__":
   
   # setup
   rpj = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", cache_dir="../datasets/")["train"].shuffle(seed=42)
-  tokenizer = LlamaTokenizer.from_pretrained("./7B_HF", add_bos_token=False)
+  tokenizer = Tokenizer.from_pretrained("./7B_HF", add_bos_token=False)
 
   # train
   train_bigram = True # not os.path.exists(f"{data_dir}/bigram.pt")

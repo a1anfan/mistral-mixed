@@ -2,12 +2,23 @@ from mistral.cache import RotatingBufferCache
 import logging
 import torch
 import fire
-from typing import List
+import os
+import time
+import sys
+import json
+from typing import List, Optional
 from pathlib import Path
+
+from fairscale.nn.model_parallel.initialize import (
+    get_model_parallel_rank,
+    initialize_model_parallel,
+    model_parallel_is_initialized,
+)
 
 from mistral.mixed_model import MixedTransformer
 from mistral.tokenizer import Tokenizer
 from mistral.beam import Beam
+from mistral.mixed_model import ModelArgs
 
 
 def sample_top_p(probs: torch.Tensor, p: float):
@@ -31,140 +42,173 @@ def sample(logits: torch.Tensor, temperature: float, top_p: float):
 
     return next_token.reshape(-1)
 
-@torch.inference_mode()
-def beam_generate(
-    self,
-    prompt_tokens: List[List[int]],
-    max_gen_len: int,
-    mixing_method: str,
-    smoothing: str,
-    n_token_consider: int,
-    n_token_sample: int,
-    alpha: int, # weight on bigram probs
-    temp: int,
-    n_drafts: int = 1, # number of beams
-    debug: bool = False,
-    verbose: bool = False,
-    i_weights = None,
-    i_length = None,
-    ngrams = None,
-    sample_beams: bool = False,
-    diversity_boost = (None, None),
-    sample_tokens: bool = False
-):
-    """
-    Run multi-sequence generation using mixed embeddings.
-    Args:
-        prompt_tokens (List[List[int]]): Initial tokenized prompts
-        max_gen_len (int): Max generation length
-        mixing_method (str): Mixing method
-        smoothing (str): Smoothing method
-        ngram_length (int): Length of ngrams for smoothing
-        n_token_consider (int): Number of tokens to normalize for before running beam search
-        n_token_sample (int): Number of tokens to consider from n_token_consider
-        alpha (float): Weight for N-Gram probabilities
-        temp (float): Temperature
-        n_drafts (int): Number of drafts (Default 1)
-        debug (bool): Whether to print outputs
-        verbose (bool): Whether to store and return model hidden states (Default False)
-        i_weights (list): List of weights corresponding to ngrams in i_length
-        i_length (list): Ngram lengths to use in interpolation
-        beam_selection_temp (float): Temperature for sampling beams (default None)
-        diversity_boost (tuple(int, float)): Tuple of (a, b) denoting a additional tokens to mask for each draft and 
-        sample_tokens (bool): Whether to sample next tokens passed into the beam search algorithm
-    
-    Returns:
-        (alive_seq, alive_ppl), (fin_seq, fin_ppl)
-    """
-    # check batch size and prompt lengths
-    params = self.model.params
-    bsz = len(prompt_tokens)
-    assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
-
-    min_prompt_len = min(len(t) for t in prompt_tokens)
-    max_prompt_len = max(len(t) for t in prompt_tokens)
-    assert min_prompt_len == max_prompt_len, "Prompt lengths must be equal"
-    prompt_len = min_prompt_len
-    assert max_prompt_len <= params.max_seq_len
-    total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
-    pad_id = self.tokenizer.pad_id
-    
-    # initialize token tensor
-    tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=self.device)
-    for k, t in enumerate(prompt_tokens):
-        tokens[k, :len(t)] = torch.tensor(t, dtype=torch.long, device=self.device)
-    
-    # if no generation possible
-    if min_prompt_len == total_len:
-        raise RuntimeError("no generation possible")
-
-    ### INTIALIZATION ###
-    initial_tokens = tokens.unsqueeze(1).repeat(1, n_drafts, 1)
-    beam_search = Beam(initial_tokens, 
-                        tokenizer=self.tokenizer,
-                        vocab_size=params.vocab_size,
-                        mixing_method=mixing_method,
-                        smoothing=smoothing,
-                        alpha=alpha,
-                        verbose=debug,
-                        i_weights=i_weights,
-                        i_length=i_length,
-                        ngrams=ngrams,
-                        sample_beams=sample_beams,
-                        diversity_boost=diversity_boost,
-                        sample_tokens=sample_tokens)
-    unseen_first = torch.ones(bsz) # 1 if still parsing prompt
-    token_weights = torch.zeros(bsz, self.model.vocab_size)
-    if verbose:
-        state_list = []
-    prev_pos = 0
-    ### INFERENCE ###
-    for cur_pos in range(min_prompt_len, total_len):
-        input_text_mask = tokens != pad_id
-        
-        # Model step
-        if cur_pos == min_prompt_len:
-            token_weights = None
-        logits = self.model.forward(tokens[:, prev_pos:cur_pos], 
-                                    start_pos=prev_pos, 
-                                    token_weights=token_weights, 
-                                    verbose=verbose)
-        if verbose:
-            logits, states = logits
-        
-        # Softmax
-        if temp > 0:
-            probs = torch.softmax(logits[:, -1] / temp, dim=-1)
+class MixedMistral:
+    @staticmethod
+    def build(
+        folder: Path,
+        max_batch_size: int = 1,
+        num_pipeline_ranks: int = 1,
+        device="cuda",
+        dtype=torch.float16,
+    ) -> "MixedMistral":
+        with open(folder / "params.json", "r") as f:
+            model_args = ModelArgs.from_dict(json.load(f))
+        model_args.max_batch_size = max_batch_size
+        if num_pipeline_ranks > 1:
+            pipeline_rank = torch.distributed.get_rank()
         else:
-            raise RuntimeError("Temperature must be greater than 0 while mixing")
-        if verbose:
-            states["end_probs"] = probs
-            state_list.append(states)
+            pipeline_rank = 0
+        with torch.device("meta"):
+            model = MixedTransformer(
+                model_args,
+                pipeline_rank=pipeline_rank,
+                num_pipeline_ranks=num_pipeline_ranks,
+            )
+        loaded = torch.load(str(folder / "consolidated.00.pth"), mmap=True)
+        model.load_state_dict(loaded, assign=True)
+        model = model.to(device=device, dtype=dtype)
+        tokenizer = Tokenizer(str(folder / "tokenizer.model"))  # ASSUMES THAT TOKENIZER.MODEL IS IN THE FOLDER!
+        return MixedMistral(model, tokenizer, device)
 
-        # Flag prompts on first generation
-        is_first = torch.mul(tokens[:, cur_pos] == pad_id, unseen_first)
-        unseen_first[is_first.nonzero(as_tuple=True)[0]] = 0
+    def __init__(self, model: MixedTransformer, tokenizer: Tokenizer, device):
+        self.model = model.to(device).eval()
+        self.tokenizer = tokenizer
+        self.device = device
+
+    @torch.inference_mode()
+    def beam_generate(
+        self,
+        prompt_tokens: List[List[int]],
+        max_gen_len: int,
+        mixing_method: str,
+        smoothing: str,
+        n_token_consider: int,
+        n_token_sample: int,
+        alpha: int, # weight on bigram probs
+        temp: int,
+        n_drafts: int = 1, # number of beams
+        debug: bool = False,
+        verbose: bool = False,
+        i_weights = None,
+        i_length = None,
+        ngrams = None,
+        sample_beams: bool = False,
+        diversity_boost = (None, None),
+        sample_tokens: bool = False
+    ):
+        """
+        Run multi-sequence generation using mixed embeddings.
+        Args:
+            prompt_tokens (List[List[int]]): Initial tokenized prompts
+            max_gen_len (int): Max generation length
+            mixing_method (str): Mixing method
+            smoothing (str): Smoothing method
+            ngram_length (int): Length of ngrams for smoothing
+            n_token_consider (int): Number of tokens to normalize for before running beam search
+            n_token_sample (int): Number of tokens to consider from n_token_consider
+            alpha (float): Weight for N-Gram probabilities
+            temp (float): Temperature
+            n_drafts (int): Number of drafts (Default 1)
+            debug (bool): Whether to print outputs
+            verbose (bool): Whether to store and return model hidden states (Default False)
+            i_weights (list): List of weights corresponding to ngrams in i_length
+            i_length (list): Ngram lengths to use in interpolation
+            beam_selection_temp (float): Temperature for sampling beams (default None)
+            diversity_boost (tuple(int, float)): Tuple of (a, b) denoting a additional tokens to mask for each draft and 
+            sample_tokens (bool): Whether to sample next tokens passed into the beam search algorithm
         
-        # Flag prompts not yet generating
-        still_prompt = input_text_mask[:, cur_pos]
+        Returns:
+            (alive_seq, alive_ppl), (fin_seq, fin_ppl)
+        """
+        # check batch size and prompt lengths
+        params = self.model.params
+        bsz = len(prompt_tokens)
+        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+
+        min_prompt_len = min(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)
+        assert min_prompt_len == max_prompt_len, "Prompt lengths must be equal"
+        prompt_len = min_prompt_len
+        assert max_prompt_len <= params.max_seq_len
+        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
+        pad_id = self.tokenizer.pad_id
         
-        # Beam pass
-        token_weights = beam_search(probs, still_prompt, is_first, cur_pos, n_token_consider, n_token_sample, use_mix=True)
+        # initialize token tensor
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=self.device)
+        for k, t in enumerate(prompt_tokens):
+            tokens[k, :len(t)] = torch.tensor(t, dtype=torch.long, device=self.device)
         
-        # Do not mix for prompts not yet generating
-        keep_idx = input_text_mask[:, cur_pos].ravel().nonzero()
-        keep_token_weights = torch.zeros_like(token_weights)
-        keep_token_weights[keep_idx, tokens[keep_idx, cur_pos]] = 1
-        token_weights = torch.where(input_text_mask[:, cur_pos].unsqueeze(1).expand(-1, self.model.vocab_size), 
-                                    keep_token_weights, token_weights)
-        prev_pos = cur_pos
-        
-    ### RETURN ###
-    results = beam_search.return_results(prompt_len)
-    if verbose:
-        return results, state_list
-    else:
-        return results
+        # if no generation possible
+        if min_prompt_len == total_len:
+            raise RuntimeError("no generation possible")
+
+        ### INTIALIZATION ###
+        initial_tokens = tokens.unsqueeze(1).repeat(1, n_drafts, 1)
+        beam_search = Beam(initial_tokens, 
+                            tokenizer=self.tokenizer,
+                            vocab_size=params.vocab_size,
+                            mixing_method=mixing_method,
+                            smoothing=smoothing,
+                            alpha=alpha,
+                            verbose=debug,
+                            i_weights=i_weights,
+                            i_length=i_length,
+                            ngrams=ngrams,
+                            sample_beams=sample_beams,
+                            diversity_boost=diversity_boost,
+                            sample_tokens=sample_tokens)
+        unseen_first = torch.ones(bsz) # 1 if still parsing prompt
+        token_weights = torch.zeros(bsz, self.model.vocab_size)
+        if verbose:
+            state_list = []
+        prev_pos = 0
+        ### INFERENCE ###
+        for cur_pos in range(min_prompt_len, total_len):
+            input_text_mask = tokens != pad_id
+            
+            # Model step
+            if cur_pos == min_prompt_len:
+                token_weights = None
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], 
+                                        start_pos=prev_pos, 
+                                        token_weights=token_weights, 
+                                        verbose=verbose)
+            if verbose:
+                logits, states = logits
+            
+            # Softmax
+            if temp > 0:
+                probs = torch.softmax(logits[:, -1] / temp, dim=-1)
+            else:
+                raise RuntimeError("Temperature must be greater than 0 while mixing")
+            if verbose:
+                states["end_probs"] = probs
+                state_list.append(states)
+
+            # Flag prompts on first generation
+            is_first = torch.mul(tokens[:, cur_pos] == pad_id, unseen_first)
+            unseen_first[is_first.nonzero(as_tuple=True)[0]] = 0
+            
+            # Flag prompts not yet generating
+            still_prompt = input_text_mask[:, cur_pos]
+            
+            # Beam pass
+            token_weights = beam_search(probs, still_prompt, is_first, cur_pos, n_token_consider, n_token_sample, use_mix=True)
+            
+            # Do not mix for prompts not yet generating
+            keep_idx = input_text_mask[:, cur_pos].ravel().nonzero()
+            keep_token_weights = torch.zeros_like(token_weights)
+            keep_token_weights[keep_idx, tokens[keep_idx, cur_pos]] = 1
+            token_weights = torch.where(input_text_mask[:, cur_pos].unsqueeze(1).expand(-1, self.model.vocab_size), 
+                                        keep_token_weights, token_weights)
+            prev_pos = cur_pos
+            
+        ### RETURN ###
+        results = beam_search.return_results(prompt_len)
+        if verbose:
+            return results, state_list
+        else:
+            return results
 
 
 @torch.inference_mode()

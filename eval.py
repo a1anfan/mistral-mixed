@@ -42,7 +42,7 @@ def evaluate_mixed_losses(data: List[List[str]],
     Args:
         data (List[List[String]]): Input data
         model (Any): Model
-        tokenizer (Any): Llama tokenizer
+        tokenizer (Any): Mistral tokenizer
         prompt_len (int): Number of tokens in starting prompt
         max_gen_len (int): Maximum numbers of tokens to generate
         alpha (float): Alpha value
@@ -112,7 +112,7 @@ def evaluate_nucleus_losses(data,
     Args:
         data (List[List[String]]): Input data
         model (Any): Model
-        tokenizer (Any): Llama tokenizer
+        tokenizer (Any): Mistral tokenizer
         prompt_len (int): Number of tokens in starting prompt
         max_gen_len (int): Maximum numbers of tokens to generate
         temp (float): Temperature

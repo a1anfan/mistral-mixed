@@ -36,7 +36,7 @@ class Beam(nn.Module):
         Args:
             initial_tokens (torch.Tensor): Initial tokens
             n_prompts (int): Number of prompts
-            tokenizer (Tokenizer): Llama tokenizer
+            tokenizer (Tokenizer): Mistral tokenizer
             vocab_size (int): Total vocab size
             mixing_method (str): Method to create mixing matrix
             smoothing (str): Smoothing method (either interpol or geom)
